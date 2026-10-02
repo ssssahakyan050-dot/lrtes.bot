@@ -1,7 +1,8 @@
 import os
 import random
 import logging
-from flask import Flask, request
+import threading
+from flask import Flask
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
@@ -47,10 +48,11 @@ async def cmd_start(message: types.Message):
         await message.answer("Դուք արգելափակված եք այս բոտում:")
         return
 
+    bot_info = await bot.me()
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⭐ Դոնատ ադմինին", callback_data="donate_admin")],
         [InlineKeyboardButton(text="✉️ Անանուն նամակ ադմինին", callback_data="anon_msg")],
-        [InlineKeyboardButton(text="➕ Ավելացնել չատը սեփական բոտում", url=f"https://t.me/{(await bot.me()).username}?startgroup=true")]
+        [InlineKeyboardButton(text="➕ Ավելացնել չատը սեփական բոտում", url=f"https://t.me/{bot_info.username}?startgroup=true")]
     ])
     
     welcome_text = (
@@ -59,16 +61,18 @@ async def cmd_start(message: types.Message):
         "• Մասնակիցների քանակը՝ 3-ից 20 հոգի:\n"
         "• 12 մասնակից անվճար է, մնացած 8-ը պետք է վճարեն 5 աստղ:\n"
         "• Խաղի ընթացքում բոլորը հերթով ասում են մեկական բառ, իսկ լրտեսը փորձում է գուշակել բառը կամ չմատնվել:\n"
-        "• Օգտագործեք /game_hay_lrtes խաղը սկսելու համար և /help՝ բոլոր հրամանները տեսնելու համար։"
+        "• Օգտագործեք /game_hay_lrtes խաղը սկսելու համար։"
     )
     await message.answer(welcome_text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
 
-@dp.callback_query()
-async def callback_handler(call: types.CallbackQuery):
-    if call.data == "donate_admin":
-        await call.message.answer("Ցանկացած քանակությամբ աստղեր նվիրաբերելու համար խնդրում ենք դիմել ադմինին ուղղակիորեն կամ օգտագործել Telegram-ի Stars ֆունկցիան:")
-    elif call.data == "anon_msg":
-        await call.message.answer("Գրեք ձեր անանուն նամակը որպես պատասխան այս հաղորդագրությանը, և այն կփոխանցվի ադմինին։")
+@dp.callback_query(lambda c: c.data == "donate_admin")
+async def donate_callback(call: types.CallbackQuery):
+    await call.message.answer("Ցանկացած քանակությամբ աստղեր նվիրաբերելու համար խնդրում ենք դիմել ադմինին ուղղակիորեն կամ օգտագործել Telegram-ի Stars ֆունկցիան:")
+    await call.answer()
+
+@dp.callback_query(lambda c: c.data == "anon_msg")
+async def anon_callback(call: types.CallbackQuery):
+    await call.message.answer("Գրեք ձեր անանուն նամակը որպես պատասխան այս հաղորդագրությանը, և այն կփոխանցվի ադմինին։")
     await call.answer()
 
 @dp.message(Command("game_hay_lrtes"))
@@ -88,7 +92,7 @@ async def cmd_game_init(message: types.Message):
         [InlineKeyboardButton(text="🎮 Միանալ խաղին", callback_data="join_game")]
     ])
     roles = get_roles()
-    await message.answer(f"Արի! **{roles['chat_title']}** խաղը քեզ է սպասում։\nՍեղմեք ներքևի կոճակը խաղին միանալու համար (Մինիմում՝ 3, Մաքսիմում՝ 20 մասնակից):", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+    await message.answer(f"Արի! {roles['chat_title']} խաղը քեզ է սպասում։\nՍեղմեք ներքևի կոճակը խաղին միանալու համար (Մինիմում՝ 3, Մաքսիմում՝ 20 մասնակից):", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
 
 @dp.callback_query(lambda c: c.data == "join_game")
 async def join_game_callback(call: types.CallbackQuery):
@@ -106,7 +110,7 @@ async def join_game_callback(call: types.CallbackQuery):
         return
 
     if len(game["players"]) >= 20:
-        await call.answer("Խաղցողների առավելագույն քանակը լրացել է:", show_alert=True)
+        await call.answer("Խաղացողների առավելագույն քանակը լրացել է:", show_alert=True)
         return
 
     if len(game["players"]) >= 12:
@@ -149,7 +153,7 @@ async def start_game_process(message: types.Message):
     for uid in players:
         try:
             if uid in spies:
-                await bot.send_message(uid, f"⚠️ Դուք **{roles['spy']}** եք այս խաղում։ Գաղտնի բառը չգիտեք։")
+                await bot.send_message(uid, f"⚠️ Դուք {roles['spy']} եք այս խաղում։ Գաղտնի բառը չգիտեք։")
             else:
                 await bot.send_message(uid, f"Այս խաղի գաղտնի բառն է՝ **{secret_word}**։ Դուք {roles['player']} եք։")
         except:
@@ -200,21 +204,21 @@ async def theme_new_year(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
     global bot_theme
     bot_theme = "new_year"
-    await message.answer("🎄 Ամանորյա ոճն ակտիվացված է։ Լրտեսը այժմ **Ձմեռ պապիկ** է։")
+    await message.answer("🎄 Ամանորյա ոճն ակտիվացված է։ Լրտեսը այժմ Ձմեռ պապիկ է։")
 
 @dp.message(Command("halloween"))
 async def theme_halloween(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
     global bot_theme
     bot_theme = "halloween"
-    await message.answer("🎃 Հելոինյան ոճն ակտիվացված է։ Լրտեսը այժմ **Զոմբի** է։")
+    await message.answer("🎃 Հելոինյան ոճն ակտիվացված է։ Լրտեսը այժմ Զոմբի է։")
 
 @dp.message(Command("valentin"))
 async def theme_valentin(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
     global bot_theme
     bot_theme = "valentin"
-    await message.answer("💖 Սիրահարների տոնի ոճն ակտիվացված է։ Լրտեսը այժմ **Վալենտին** է։")
+    await message.answer("💖 Սիրահարների տոնի ոճն ակտիվացված է։ Լրտեսը այժմ Վալենտին է։")
 
 @dp.message(Command("normal_bot"))
 async def theme_normal(message: types.Message):
@@ -230,10 +234,20 @@ async def admin_text(message: types.Message):
     if text_to_send:
         await message.answer(f"📢 **Հայտարարություն ադմինից:**\n\n{text_to_send}", parse_mode=ParseMode.MARKDOWN)
 
+# Flask վեբ սերվեր Render-ի համար
 @app.route("/")
 def index():
     return "Bot is running!"
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
+if __name__ == "__main__":
+    # Գործարկում ենք Flask-ը առանձին թրեդով, որպեսզի չարգելափակի բոտի աշխատանքը
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.start()
+    
+    # Գործարկում ենք Telegram բոտը (Polling)
+    import asyncio
+    asyncio.run(dp.start_polling(bot))
