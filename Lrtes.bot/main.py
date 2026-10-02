@@ -1,337 +1,405 @@
-import os
-import random
+import asyncio
 import logging
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
+import random
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
-from flask import Flask
-from threading import Thread
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    LabeledPrice, Message
+)
 from google import genai
+from config import BOT_TOKEN, ADMIN_ID, GEMINI_API_KEY
 
-# --- ԿԱՐԳԱՎՈՐՈՒՄՆԵՐ ---
-TOKEN = "YOUR_BOT_TOKEN_HERE"          # Փոխարինեք ձեր Telegram բոտի թոքենով
-ADMIN_ID = 123456789                  # Գրեք ձեր Telegram ID-ն (որպես ադմին)
-GEMINI_API_KEY = "YOUR_GEMINI_KEY_HERE" # Ձեր Gemini API ստեղնը (Key)
-
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
-
-# Gemini գլայենդի կարգավորում
-client = genai.Client(api_key=GEMINI_API_KEY)
-
+# Լոգավորման կարգավորում
 logging.basicConfig(level=logging.INFO)
 
-# Flask սերվեր (Render/Koyeb/GitHub հոսթինգների համար, որ 24/7 աշխատի)
-app = Flask('')
+bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 
-@app.route('/')
-def home():
-    return "I am alive!"
+# --- GEMINI AI ԿԱՐԳԱՎՈՐՈՒՄ ---
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY and GEMINI_API_KEY != "ՁԵՐ_GEMINI_API_ԿԵՅԸ_ԱՅՍՏԵՂ" else None
 
-def run():
-    app.run(host='0.0.0.0', port=8080)
+# --- FSM (Վիճակների մեքենա) ---
+class AdminContactStates(StatesGroup):
+    waiting_for_message = State()
+    waiting_for_stars_amount = State()
+    waiting_for_ai_prompt = State()
 
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
+# --- ՀԻՇՈՂՈՒԹՅՈՒՆ ԵՎ ԿԱՐԳԱՎՈՐՈՒՄՆԵՐ ---
+active_games = {}
+current_theme = "normal"  # normal, new_year, valentine, halloween
 
-# Խաղի թեմաներ և ադմինական կարգավորումներ
-THEMES = {
-    "normal": {"spy": "լրտես", "name": "Ստանդարտ"},
-    "new_year": {"spy": "ձմեր պապիկ", "name": "Ամանորյա 🎄"},
-    "halloween": {"spy": "զոմբի", "name": "Հելոինի 🎃"},
-    "valentin": {"spy": "վալենտին", "name": "Սիրահարների տոնի ❤️"}
-}
-current_theme = "normal"
-
-# Հիշողության տվյալների բազա
-users_points = {}       # {user_id: points}
-banned_users = set()    # Արգելափակված օգտատերեր
-active_games = {}       # {chat_id: game_data}
-
-# FSM վիճակներ (States)
-class States(StatesGroup):
-    waiting_for_donation_amount = State()
-    waiting_for_anonymous_msg = State()
-    waiting_for_admin_broadcast = State()
-
-# --- ԳԼԽԱՎՈՐ ՄԵՆՅՈՒԻ ԿՈՃԱԿՆԵՐ ---
-def get_main_menu_keyboard(bot_username: str):
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⭐ Դոնատ ադմինին", callback_data="donate_admin")],
-        [InlineKeyboardButton(text="✉️ Անանուն նամակ ադմինին", callback_data="anon_msg")],
-        [InlineKeyboardButton(text="➕ Ավելացնել չատը սեփական բոտում", url=f"https://t.me/{bot_username}?startgroup=true")]
-    ])
-    return keyboard
-
-# --- /start ՀՐԱՄԱՆ ---
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    if str(message.from_user.id) in banned_users or message.from_user.username in banned_users:
-        return await message.reply("Դուք արգելափակված եք այս բոտում:")
-    
-    bot_info = await bot.get_me()
-    welcome_text = (
-        "🤖 **Ես բոտ խաղավարն եմ և այլն!**\n\n"
-        "Բարի գալուստ «Լրտես» խաղ: Այս բոտի միջոցով դուք կարող եք խաղալ ձեր ընկերների հետ, ուղարկել անանուն նամակներ, աստղեր նվիրել ադմինին և այլն:\n\n"
-        "📌 **Հիմնական հրամանները՝**\n"
-        "/game_hay_lrtes - Սկսել նոր խաղային գրանցում\n"
-        "/top_hay_lrtes - Տեսնել թոփ 10 մասնակիցներին\n"
-        "/cancel_game - Չեղարկել ընթացիկ խաղը"
-    )
-    await message.answer(welcome_text, reply_markup=get_main_menu_keyboard(bot_info.username), parse_mode="Markdown")
-
-
-# --- ԴՈՆԱՏ ԵՎ ԱՆԱՆՈՒՆ ՆԱՄԱԿՆԵՐ ---
-@dp.callback_query(F.data == "donate_admin")
-async def cb_donate(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("⭐ Գրեք, թե քանի աստղ եք ցանկանում դոնատ անել ադմինին (գրեք միայն թիվ):")
-    await state.set_state(States.waiting_for_donation_amount)
-    await callback.answer()
-
-@dp.message(States.waiting_for_donation_amount)
-async def process_donation(message: types.Message, state: FSMContext):
-    try:
-        amount = int(message.text)
-        await bot.send_message(ADMIN_ID, f"⭐ **Նոր դոնատ!**\nՕգտատեր՝ {message.from_user.full_name} (@{message.from_user.username})\nՑանկանում է նվիրել: **{amount} աստղ**:")
-        await message.reply(f"Շնորհակալություն! {amount} աստղի դոնատի հարցումը ուղարկվեց ադմինին:")
-    except ValueError:
-        await message.reply("Խնդրում եմ գրել միայն թիվ:")
-    await state.clear()
-
-@dp.callback_query(F.data == "anon_msg")
-async def cb_anon(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("✉️ Գրեք ձեր անանուն նամակը ադմինին, և այն անմիջապես կփոխանցվի:")
-    await state.set_state(States.waiting_for_anonymous_msg)
-    await callback.answer()
-
-@dp.message(States.waiting_for_anonymous_msg)
-async def process_anon_msg(message: types.Message, state: FSMContext):
-    user = message.from_user
-    text = (
-        f"✉️ **Անանուն նամակ:**\n\n"
-        f"{message.text}\n\n"
-        f"👤 Նիկնեյմ: {user.full_name} (@{user.username if user.username else 'չկա'})\n"
-        f"🆔 Ուսեր Այդի: `{user.id}`"
-    )
-    await bot.send_message(ADMIN_ID, text, parse_mode="Markdown")
-    await message.reply("✅ Ձեր անանուն նամակը հաջողությամբ հասավ ադմինին:")
-    await state.clear()
-
-
-# --- ԼՐՏԵՍ ԽԱՂԻ ՀԱՄԱԿԱՐԳ ---
-
-@dp.message(Command("game_hay_lrtes"))
-async def cmd_game_start_reg(message: types.Message):
-    chat_id = message.chat.id
-    if chat_id in active_games:
-        return await message.reply("⚠️ Այս չատում արդեն կա ակտիվ խաղ կամ գրանցում:")
-    
-    active_games[chat_id] = {
-        "status": "registration",
-        "players": {}, # {user_id: full_name}
-        "paid_players": set(),
-        "creator": message.from_user.id
+# Տոնական թեմաների վայրերի բազաներ և դիզայն
+THEMES_DATA = {
+    "normal": {
+        "name": "🌟 Ստանդարտ (Normal)",
+        "locations": [
+            "Բանկ", "Ինքնաթիռ", "Հիվանդանոց", "Ռեստորան", "Սուպերմարկետ",
+            "Տիեզերակայան", "Ոստիկանություն", "Կազինո", "Զինվորական բազա", 
+            "Դպրոց", "Կինոթատրոն", "Նավահանգիստ", "Հյուրանոց"
+        ]
+    },
+    "new_year": {
+        "name": "🎄 Ամանորյա (New Year)",
+        "locations": [
+            "Ձնեմարդու արհեստանոց", "Ձմեռ պապի նստավայր", "Տոնածառի տոնավաճառ",
+            "Սահնակների ավտոտնակ", "Նվերների փաթեթավորման բաժին", "Տաք շոկոլադի սրճարան",
+            "Սահադաշտ", "Ամանորյա հրավառության դաշտ", "Հյուսիսային բևեռի փոստ"
+        ]
+    },
+    "valentine": {
+        "name": "💖 Սուրբ Վալենտին (Valentine's Day)",
+        "locations": [
+            "Ռոմանտիկ սրճարան", "Ծաղկի խանութ", "Սրտաձև շոկոլադի ֆաբրիկա",
+            "Համբույրների կամուրջ", "Աստղադիտարան", "Գաղտնի նամակների արխիվ",
+            "Վարդերի այգի", "Ամհարսանքի սրահ", "Սիրային զբոսանավ"
+        ]
+    },
+    "halloween": {
+        "name": "🎃 Հելոուին (Halloween)",
+        "locations": [
+            "Հին Լքված Աղջկա Անտուն Տուն", "Վամպիրների Ամրոց", "Կախարդների Խոհանոց",
+            "Գերեզմանոց գիշերով", "Դդմե դաշտ", "Ուրվականների հյուրանոց",
+            "Զոմբիների լաբորատորիա", "Մութ անտառ", "Սատանայական ջրաղաց"
+        ]
     }
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎮 Միանալ խաղին", callback_data="join_game")]
-    ])
-    await message.answer(
-        "🕵️‍♂️️ **Արի լրտեսը քեզ է սպասում!**\n\n"
-        "• Մինիմում մասնակիցներ՝ 3\n"
-        "• Մաքսիմում մասնակիցներ՝ 20\n"
-        "• Առաջին 12 մասնակիցն մասնակցում է անվճար, մնացած 8-ը՝ 5 աստղով։\n\n"
-        "**Միացածների ցանկ՝**\n(դեռևս ոչ ոք չի միացել)",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
+}
 
-@dp.callback_query(F.data == "join_game")
-async def cb_join_game(callback: types.CallbackQuery):
-    chat_id = callback.message.chat.id
-    user = callback.from_user
-    
-    if chat_id not in active_games or active_games[chat_id]["status"] != "registration":
-        return await callback.answer("Խաղի գրանցումն ավարտված է կամ չկա ակտիվ խաղ:", show_alert=True)
-    
-    game = active_games[chat_id]
-    if user.id in game["players"]:
-        return await callback.answer("Դուք արդեն միացել եք խաղին!", show_alert=True)
-    
-    if len(game["players"]) >= 20:
-        return await callback.answer("Խաղն արդեն լցվել է (առավելագույնը 20 հոգի):", show_alert=True)
-    
-    # 12-րդ մասնակցից հետո պահանջվում է 5 աստղ
-    if len(game["players"]) >= 12:
-        if user.id not in game["paid_players"]:
-            game["paid_players"].add(user.id) # Պայմանականորեն գրանցում ենք վճարված
-    
-    game["players"][user.id] = user.full_name
-    
-    players_list_str = "\n".join([f"• {name}" for name in game["players"].values()])
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎮 Միանալ խաղին", callback_data="join_game")]
+# --- ՄԵՆՅՈՒՆԵՐ ---
+def get_main_menu():
+    theme_info = THEMES_DATA[current_theme]["name"]
+    keyboard = [
+        [InlineKeyboardButton(text="🤖 Զրույց Gemini AI-ի հետ", callback_data="gemini_chat_start")],
+        [InlineKeyboardButton(text="💌 Անանուն նամակ ադմինին", callback_data="send_anon")],
+        [InlineKeyboardButton(text="⭐ Դոնատ ադմինին (Stars)", callback_data="donate_start")],
+        [InlineKeyboardButton(text=f"🎭 Թեմա: {theme_info}", callback_data="change_theme_menu")],
+        [InlineKeyboardButton(text="🎮 Ինչպես խաղալ Լրտես", callback_data="help_spy")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def get_back_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Վերադառնալ մենյու", callback_data="back_to_menu")]
     ])
-    
-    try:
-        await callback.message.edit_text(
-            "🕵️‍♂️ **Արի լրտեսը քեզ է սպասում!**\n\n"
-            f"Մասնակիցների քանակը: {len(game['players'])}/20\n\n"
-            f"**Միացածներ՝**\n{players_list_str}",
-            reply_markup=keyboard,
-            parse_mode="Markdown"
+
+# --- /START ՀՐԱՄԱՆ ---
+@dp.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    if message.chat.type == "private":
+        await message.answer(
+            "Բարև ձեզ 👋!\n"
+            "Սա բազմաֆունկցիոնալ բոտ է **«Լրտես»** խաղի, Google Gemini AI զրույցի, անանուն նամակների և ադմինին դոնատի համար։\n\n"
+            f"Ընթացիկ թեման՝ **{THEMES_DATA[current_theme]['name']}**\n\n"
+            "Ընտրեք գործողությունը ստորև 👇",
+            reply_markup=get_main_menu()
         )
-    except Exception:
-        pass
-    await callback.answer("Դուք հաջողությամբ միացաք խաղին!")
+    else:
+        await message.answer(f"Բոտը պատրաստ է 🕵️‍♂️ (Թեմա՝ {THEMES_DATA[current_theme]['name']})! Խմբում խաղ սկսելու համար գրեք `/spy`:")
 
-@dp.message(Command("start_hay_lrtes"))
-async def cmd_run_game(message: types.Message):
-    chat_id = message.chat.id
-    if chat_id not in active_games or active_games[chat_id]["status"] != "registration":
-        return await message.reply("Գրանցման փուլում գտնվող ակտիվ խաղ չկա:")
-    
-    game = active_games[chat_id]
-    if len(game["players"]) < 3:
-        return await message.reply("Խաղը սկսելու համար անհրաժեշտ է նվազագույնը 3 մասնակից:")
-    
-    game["status"] = "playing"
-    
-    # Ստանում ենք գաղտնի բառ Gemini-ից
+@dp.callback_query(F.data == "back_to_menu")
+async def back_to_menu_handler(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("Գլխավոր մենյու 👇", reply_markup=get_main_menu())
+    await callback.answer()
+
+
+# --- GEMINI AI ԻՆՏԵԳՐԱՑԻԱ ---
+@dp.callback_query(F.data == "gemini_chat_start")
+async def gemini_chat_start(callback: types.CallbackQuery, state: FSMContext):
+    if not client:
+        await callback.answer("❌ Gemini API Key-ը կարգավորված չէ config.py ֆայլում:", show_alert=True)
+        return
+
+    await state.set_state(AdminContactStates.waiting_for_ai_prompt)
+    await callback.message.edit_text(
+        "🤖 **Google Gemini AI Զրույց**\n\n"
+        "Գրեք ձեր հարցը, խնդրանքը կամ տեքստը, և ինտելեկտուալ բոտը անմիջապես կպատասխանի ձեզ 👇",
+        reply_markup=get_back_menu()
+    )
+    await callback.answer()
+
+@dp.message(AdminContactStates.waiting_for_ai_prompt)
+async def process_gemini_prompt(message: Message, state: FSMContext):
+    if not client:
+        await message.answer("❌ AI սերվերը հասանելի չէ:", reply_markup=get_main_menu())
+        await state.clear()
+        return
+
+    user_text = message.text
+    if not user_text:
+        await message.answer("Խնդրում եմ ուղարկել տեքստային հարց:")
+        return
+
+    waiting_msg = await message.answer("⏳ Gemini-ն մտածում է պատասխանը...")
+
     try:
         response = client.models.generate_content(
             model="gemini-2.5-flash",
-            contents="Տուր մեկ հետաքրքրաշարժ հասարակ առարկայի կամ հասկացության բառ հայերենով (օրինակ՝ խնձոր, ինքնաթիռ, հեռախոս, գիրք), միայն մեկ բառ գրիր առանց հավելյալ տեքստի:"
+            contents=user_text,
         )
-        secret_word = response.text.strip()
-    except Exception:
-        secret_word = "Մատիտ"
+        ai_reply = response.text
         
-    game["secret_word"] = secret_word
-    
-    # Լրտեսների քանակի որոշում ըստ կանոնների
-    p_count = len(game["players"])
-    spy_count = 1 if 3 <= p_count <= 5 else (2 if 6 <= p_count <= 8 else 3)
-    
-    players_ids = list(game["players"].keys())
-    spies = random.sample(players_ids, spy_count)
-    game["spies"] = spies
-    
-    # Ուղարկում ենք դերերը մասնակիցներին անձնական նամակով
-    for uid in players_ids:
-        try:
-            if uid in spies:
-                spy_names_str = ", ".join([game['players'][s] for s in spies]) if spy_count > 1 else ""
-                spy_info = f" (Միմյանց գիտեք՝ {spy_names_str})" if spy_count > 1 else ""
-                theme_spy_name = THEMES[current_theme]["spy"]
-                await bot.send_message(uid, f"🤫 Դուք **{theme_spy_name}** եք այս խաղում!{spy_info}", parse_mode="Markdown")
-            else:
-                await bot.send_message(uid, f"🔑 Գաղտնի բառը՝ **{secret_word}**", parse_mode="Markdown")
-        except Exception:
-            pass
+        await bot.delete_message(chat_id=message.chat.id, message_id=waiting_msg.message_id)
+        await message.answer(
+            f"🤖 **Gemini պատասխանը:**\n\n{ai_reply}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Հարցնել ևս մեկը", callback_data="gemini_chat_start")],
+                [InlineKeyboardButton(text="⬅️ Վերադառնալ մենյու", callback_data="back_to_menu")]
+            ])
+        )
+    except Exception as e:
+        logging.error(f"Gemini Error: {e}")
+        await bot.delete_message(chat_id=message.chat.id, message_id=waiting_msg.message_id)
+        await message.answer("❌ AI-ի հետ կապվելիս սխալ տեղի ունեցավ: Փորձեք ավելի ուշ։", reply_markup=get_main_menu())
+        await state.clear()
 
-    await message.reply(
-        "🚀 **Խաղը սկսվեց!**\n"
-        f"Մասնակիցների քանակը՝ {p_count}, Լրտեսների քանակը՝ {spy_count}\n"
-        "Չատում գրելու իրավունքը փակված է մնացածների համար:",
-        parse_mode="Markdown"
+
+# --- ԹԵՄԱՆԵՐԻ ԿԱՌԱՎԱՐՈՒՄ ---
+@dp.callback_query(F.data == "change_theme_menu")
+async def change_theme_menu_handler(callback: types.CallbackQuery):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌟 Ստանդարտ", callback_data="set_theme_normal")],
+        [InlineKeyboardButton(text="🎄 Ամանոր", callback_data="set_theme_new_year")],
+        [InlineKeyboardButton(text="💖 Վալենտին", callback_data="set_theme_valentine")],
+        [InlineKeyboardButton(text="🎃 Հելոուին", callback_data="set_theme_halloween")],
+        [InlineKeyboardButton(text="⬅️ Վերադառնալ", callback_data="back_to_menu")]
+    ])
+    await callback.message.edit_text(
+        "Ընտրեք խաղի և բոտի տոնական թեման 👇\n"
+        f"(Գործող թեմա՝ **{THEMES_DATA[current_theme]['name']}**)",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("set_theme_"))
+async def set_theme_handler(callback: types.CallbackQuery):
+    global current_theme
+    theme_key = callback.data.replace("set_theme_", "")
+    if theme_key in THEMES_DATA:
+        current_theme = theme_key
+        await callback.answer(f"✅ Թեման փոխվեց՝ {THEMES_DATA[current_theme]['name']}")
+    
+    await callback.message.edit_text(
+        f"Գլխավոր մենյու:\nԸնթացիկ թեմա՝ **{THEMES_DATA[current_theme]['name']}**",
+        reply_markup=get_main_menu()
     )
 
-@dp.message(Command("cancel_game"))
-async def cmd_cancel_game(message: types.Message):
-    chat_id = message.chat.id
-    if chat_id in active_games:
-        del active_games[chat_id]
-        await message.reply("❌ Խաղը չեղարկվեց:")
-    else:
-        await message.reply("Ընթացիկ խաղ չկա:")
 
-@dp.message(Command("top_hay_lrtes"))
-async def cmd_top(message: types.Message):
-    if not users_points:
-        return await message.reply("🏆 Դեռևս չկան միավորներ հավաքած մասնակիցներ:")
+# --- ԻՆՉՊԵՍ ԽԱՂԱԼ ---
+@dp.callback_query(F.data == "help_spy")
+async def help_spy_handler(callback: types.CallbackQuery):
+    text = (
+        "🕵‍♂️ **Ինչպես խաղալ Լրտես (Spyfall):**\n\n"
+        "1. Ավելացրեք բոտը խմբային չատին:\n"
+        "2. Խմբում գրեք `/spy` հրամանը։\n"
+        "3. Մասնակիցները սեղմում են «Միանալ խաղին»։\n"
+        "4. Սեղմեք «Սկսել խաղը», և բոտը անձնական նամակով կուղարկի գաղտնի վայրը՝ կախված ընտրված տոնական թեմայից!"
+    )
+    await callback.message.edit_text(text, reply_markup=get_back_menu())
+    await callback.answer()
+
+
+# --- ԱՆԱՆՈՒՆ ՆԱՄԱԿՆԵՐԻ ՀԱՄԱԿԱՐԳ ---
+@dp.callback_query(F.data == "send_anon")
+async def start_anon_message(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminContactStates.waiting_for_message)
+    await callback.message.edit_text(
+        "Գրեք ձեր անանուն նամակը ադմինին (կարող եք ուղարկել նաև նկար/տեքստ) 👇\n\n"
+        "Ադմինը կստանա նամակը ձեր նիկնեյմով և ID-ով:",
+        reply_markup=get_back_menu()
+    )
+    await callback.answer()
+
+@dp.message(AdminContactStates.waiting_for_message)
+async def process_anon_message(message: Message, state: FSMContext):
+    user = message.from_user
+    username_str = f"@{user.username}" if user.username else "Չկա username"
     
-    sorted_top = sorted(users_points.items(), key=lambda x: x[1], reverse=True)[:10]
-    top_str = "\n".join([f"{i+1}. ID: {uid} — {pts} միավոր" for i, (uid, pts) in enumerate(sorted_top)])
-    await message.reply(f"🏆 **ԹՈՓ 10 ՄԱՍՆԱԿԻՑՆԵՐ**\n\n{top_str}", parse_mode="Markdown")
-
-
-# --- ԱԴՄԻՆԻ ՀԱՏՈՒԿ ՀՐԱՄԱՆՆԵՐ ---
-
-@dp.message(Command("ban"))
-async def admin_ban(message: types.Message):
-    if message.from_user.id != ADMIN_ID: return
-    args = message.text.split()
-    if len(args) > 1:
-        username = args[1].lstrip('@')
-        banned_users.add(username)
-        await message.reply(f"🚫 @{username} օգտատերը բլոկավորվեց:")
-
-@dp.message(Command("unban"))
-async def admin_unban(message: types.Message):
-    if message.from_user.id != ADMIN_ID: return
-    args = message.text.split()
-    if len(args) > 1:
-        username = args[1].lstrip('@')
-        if username in banned_users:
-            banned_users.remove(username)
-        await message.reply(f"✅ @{username} օգտատերը հանվեց բլոկից:")
-
-@dp.message(Command("new_year"))
-async def admin_theme_ny(message: types.Message):
-    global current_theme
-    if message.from_user.id != ADMIN_ID: return
-    current_theme = "new_year"
-    await message.reply("🎄 Ակտիվացավ Ամանորյա ոճը! (Լրտես = ձմեր պապիկ)")
-
-@dp.message(Command("halloween"))
-async def admin_theme_hw(message: types.Message):
-    global current_theme
-    if message.from_user.id != ADMIN_ID: return
-    current_theme = "halloween"
-    await message.reply("🎃 Ակտիվացավ Հելոինի ոճը! (Լրտես = զոմբի)")
-
-@dp.message(Command("valentin"))
-async def admin_theme_val(message: types.Message):
-    global current_theme
-    if message.from_user.id != ADMIN_ID: return
-    current_theme = "valentin"
-    await message.reply("❤️ Ակտիվացավ Սիրահարների տոնի ոճը! (Լրտես = վալենտին)")
-
-@dp.message(Command("normal_bot"))
-async def admin_theme_norm(message: types.Message):
-    global current_theme
-    if message.from_user.id != ADMIN_ID: return
-    current_theme = "normal"
-    await message.reply("🔄 Վերադարձավ ստանդարտ տեսքին:")
-
-@dp.message(Command("text"))
-async def admin_broadcast(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID: return
-    await message.reply("Գրեք այն տեքստը, որը ցանկանում եք հրապարակել կամ ուղարկել բոտի անունից:")
-    await state.set_state(States.waiting_for_admin_broadcast)
-
-@dp.message(States.waiting_for_admin_broadcast)
-async def process_admin_broadcast(message: types.Message, state: FSMContext):
-    await message.reply(f"📢 **Ադմինի ուղերձ:**\n\n{message.text}", parse_mode="Markdown")
+    admin_text = (
+        "📩 **Նոր անանուն նամակ օգտատերից:**\n\n"
+        f"👤 **Անուն:** {user.full_name}\n"
+        f"🔗 **Username:** {username_str}\n"
+        f"🆔 **User ID:** `{user.id}`\n\n"
+        f"💬 **Նամակը:**"
+    )
+    
+    try:
+        await bot.send_message(ADMIN_ID, admin_text)
+        await message.send_copy(chat_id=ADMIN_ID)
+        await message.answer("✅ Ձեր նամակը հաջողությամբ ուղարկվեց ադմինին:", reply_markup=get_main_menu())
+    except Exception as e:
+        logging.error(f"Error: {e}")
+        await message.answer("❌ Չհաջողվեց ուղարկել նամակը:", reply_markup=get_main_menu())
+    
     await state.clear()
 
 
-# --- ԲՈՏԻ ՀՐԱՄԱՆՆԵՐԻ ՑԱՆԿԻ ԿԱՐԳԱՎՈՐՈՒՄ ---
-async def set_bot_commands():
-    commands = [
-        BotCommand(command="start", description="Գլխավոր մենյու"),
-        BotCommand(command="game_hay_lrtes", description="Սկսել լրտես խաղ"),
-        BotCommand(command="top_hay_lrtes", description="Թոփ 10 մասնակիցներ"),
-        BotCommand(command="cancel_game", description="Չեղարկել խաղը"),
-    ]
-    await bot.set_my_commands(commands)
+# --- ԴՈՆԱՏԻ ՀԱՄԱԿԱՐԳ (TELEGRAM STARS) ---
+@dp.callback_query(F.data == "donate_start")
+async def start_donation(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminContactStates.waiting_for_stars_amount)
+    await callback.message.edit_text(
+        "⭐ **Դոնատ ադմինին**\n\n"
+        "Մուտքագրեք աստղերի քանակը, որոնք ցանկանում եք նվիրաբերել (օրինակ՝ `10`, `50`, `100`):",
+        reply_markup=get_back_menu()
+    )
+    await callback.answer()
+
+@dp.message(AdminContactStates.waiting_for_stars_amount)
+async def process_stars_amount(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("❌ Խնդրում եմ մուտքագրել միայն թիվ (օրինակ՝ 10):")
+        return
+
+    amount = int(message.text)
+    if amount < 1:
+        await message.answer("❌ Աստղերի քանակը պետք է մեծ լինի 0-ից:")
+        return
+
+    await state.clear()
+    prices = [LabeledPrice(label="Աջակցություն ադմինին (Stars)", amount=amount)]
+    
+    await message.answer_invoice(
+        title="⭐ Դոնատ ադմինին",
+        description=f"Շնորհակալություն աջակցության համար ({amount} աստղ)",
+        prices=prices,
+        payload=f"donation_{message.from_user.id}_{amount}",
+        currency="XTR",
+        provider_token="",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"💳 Վճարել {amount} ⭐", pay=True)],
+            [InlineKeyboardButton(text="⬅️ Չեղարկել", callback_data="back_to_menu")]
+        ])
+    )
+
+@dp.pre_checkout_query()
+async def pre_checkout_handler(pre_checkout_query: types.PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+@dp.message(F.successful_payment)
+async def successful_payment_handler(message: Message):
+    payment_info = message.successful_payment
+    total_amount = payment_info.total_amount
+    user = message.from_user
+    
+    await message.answer(f"🎉 Շնորհակալություն! Դուք հաջողությամբ նվիրաբերեցիք {total_amount} ⭐")
+    
+    admin_msg = (
+        f"💰 **Նոր դոնատ Telegram Stars-ով!**\n\n"
+        f"👤 **Օգտատեր:** {user.full_name} (@{user.username or 'չկա'})\n"
+        f"🆔 **ID:** `{user.id}`\n"
+        f"⭐ **Գումար:** {total_amount} աստղ"
+    )
+    await bot.send_message(ADMIN_ID, admin_msg)
+
+
+# --- ԽՄԲԱՅԻՆ «ԼՐՏԵՍ» ԽԱՂ ---
+@dp.message(Command("spy"))
+async def cmd_spy_start(message: Message):
+    if message.chat.type == "private":
+        await message.answer("❌ Այս հրամանը նախատեսված է միայն խմբային չատերի համար:")
+        return
+
+    chat_id = message.chat.id
+    if chat_id in active_games and active_games[chat_id]["status"] == "playing":
+        await message.answer("⚠️ Այս չատում արդեն ընթանում է խաղ:")
+        return
+
+    active_games[chat_id] = {"players": [], "status": "waiting"}
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🙋‍♂️ Միանալ խաղին", callback_data="spy_join")],
+        [InlineKeyboardButton(text="🚀 Սկսել խաղը", callback_data="spy_start_game")]
+    ])
+
+    theme_name = THEMES_DATA[current_theme]["name"]
+    await message.answer(
+        f"🕵️‍♂ **«Լրտես» խաղը սկսվում է!**\n"
+        f"🎭 **Թեմա:** {theme_name}\n\n"
+        "Մասնակցելու համար սեղմեք **«Միանալ խաղին»** կոճակը։\n"
+        "Երբ բոլորը հավաքվեն, սեղմեք **«Սկսել խաղը»**:",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data == "spy_join")
+async def spy_join_handler(callback: types.CallbackQuery):
+    chat_id = callback.message.chat.id
+    user_id = callback.from_user.id
+    user_name = callback.from_user.first_name
+
+    if chat_id not in active_games or active_games[chat_id]["status"] != "waiting":
+        await callback.answer("❌ Ակտիվ սպասման փուլով խաղ չկա:", show_alert=True)
+        return
+
+    players = active_games[chat_id]["players"]
+    if user_id in players:
+        await callback.answer("⚠️ Դուք արդեն միացել եք խաղին:", show_alert=True)
+        return
+
+    players.append(user_id)
+    await callback.answer(f"✅ {user_name}, դուք միացաք խաղին!")
+
+    try:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"🙋‍♂️ Միանալ խաղին ({len(players)})", callback_data="spy_join")],
+            [InlineKeyboardButton(text="🚀 Սկսել խաղը", callback_data="spy_start_game")]
+        ])
+        await callback.message.edit_reply_markup(reply_markup=keyboard)
+    except Exception:
+        pass
+
+@dp.callback_query(F.data == "spy_start_game")
+async def spy_start_game_handler(callback: types.CallbackQuery):
+    chat_id = callback.message.chat.id
+
+    if chat_id not in active_games or active_games[chat_id]["status"] != "waiting":
+        await callback.answer("❌ Հնարավոր չէ սկսել խաղը:", show_alert=True)
+        return
+
+    players = active_games[chat_id]["players"]
+    if len(players) < 3:
+        await callback.answer("❌ Հարկավոր է առնվազն 3 մասնակից:", show_alert=True)
+        return
+
+    active_games[chat_id]["status"] = "playing"
+    
+    locations_list = THEMES_DATA[current_theme]["locations"]
+    chosen_location = random.choice(locations_list)
+    spy_id = random.choice(players)
+
+    for player_id in players:
+        try:
+            if player_id == spy_id:
+                await bot.send_message(
+                    player_id, 
+                    "🕵️‍♂️ **Դուք ԼՐՏԵՍՆ եք!**\n\nՓորձեք գուշակել վայրը կամ չբացահայտվել:"
+                )
+            else:
+                await bot.send_message(
+                    player_id, 
+                    f"📍 **Գաղտնի վայրը ({THEMES_DATA[current_theme]['name']}):** `{chosen_location}`\n\nԳտեք լրտեսին՝ տալով հարցեր միմյանց:"
+                )
+        except Exception:
+            pass
+
+    await callback.message.edit_text(
+        f"🎮 **Խաղը սկսված է!** ({THEMES_DATA[current_theme]['name']})\n\n"
+        f"👥 Մասնակիցներ՝ `{len(players)}` հոգի\n"
+        "📩 Դերերն ուղարկվեցին անձնական չատերով։"
+    )
+    del active_games[chat_id]
+    await callback.answer()
+
+
+# --- ԲՈՏԻ ԳՈՐԾԱՐԿՈՒՄ ---
+async def main():
+    print("Բոտը հաջողությամբ միացավ և աշխատում է...")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    keep_alive()  # Գործարկում ենք Flask սերվերը
-    import asyncio
-    asyncio.run(set_bot_commands())
-    dp.run_polling(bot)
+    asyncio.run(main())
